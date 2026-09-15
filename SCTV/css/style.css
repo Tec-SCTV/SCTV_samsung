@@ -3,6 +3,13 @@
     font-family: Arial, Helvetica, sans-serif;
 }
 
+/*
+ * IMPORTANTE: a camada web precisa ter alfa 0 para o plano de video do AVPlay
+ * (que fica ABAIXO dela) aparecer. Pintar html/body de preto opaco tapa esse
+ * plano em firmwares que nao tratam o <object type="application/avplayer">
+ * como recorte automatico -- sintoma: o audio toca e a tela fica preta. O
+ * preto de fundo do app vem de #loadingLayer, que e a tela de espera.
+ */
 html,
 body {
     width: 100%;
@@ -10,7 +17,7 @@ body {
     margin: 0;
     padding: 0;
     overflow: hidden;
-    background: #000000;
+    background: transparent;
 }
 
 /*
@@ -139,4 +146,58 @@ body {
     color: #000000;
     background: #ffffff;
     border-color: #1478ff;
+}
+
+/*
+ * Painel de diagnostico. z-index acima do popup de saida para que ele continue
+ * legivel em qualquer estado do app. Margem de 5% para respeitar a area segura
+ * da TV.
+ */
+#diagPanel {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 200;
+    padding: 54px 96px;
+    color: #ffffff;
+    background: rgba(0, 0, 0, 0.92);
+    font-family: "Courier New", Courier, monospace;
+}
+
+#diagPanel.hidden {
+    display: none;
+}
+
+#diagTitulo {
+    margin-bottom: 14px;
+    font-size: 30px;
+    font-weight: bold;
+}
+
+#diagCabecalho {
+    margin-bottom: 16px;
+    padding-bottom: 14px;
+    border-bottom: 2px solid #555555;
+    color: #7fd4ff;
+    font-size: 20px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+#diagLog {
+    height: 720px;
+    overflow: hidden;
+    font-size: 18px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+#diagRodape {
+    margin-top: 12px;
+    color: #999999;
+    font-size: 18px;
 }

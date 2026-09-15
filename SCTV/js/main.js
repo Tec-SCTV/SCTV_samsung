@@ -1,6 +1,6 @@
 /* global webapis, tizen */
 
-var APP_VERSION = "0.6.2";
+var APP_VERSION = "0.6.3";
 
 /*
  * O parser abaixo tambem entende respostas simples de Worker:
@@ -55,6 +55,19 @@ var KEY_MEDIA_PLAY_PAUSE = 10252;
 var KEY_MEDIA_PLAY = 415;
 var KEY_MEDIA_PAUSE = 19;
 
+/*
+ * Diagnostico na tela.
+ *
+ * O relatorio de reprovacao da Samsung nao diz em qual aparelho a falha foi
+ * reproduzida, e o inspetor remoto nao existe numa TV de loja ou de terceiro.
+ * Cinco toques em CIMA dentro da janela abaixo abrem um painel com modelo,
+ * firmware, URL em uso e as ultimas linhas de log. CIMA nao tem outra funcao
+ * fora do popup de saida, entao nao conflita com o uso normal do controle.
+ */
+var DIAG_TOQUES = 5;
+var DIAG_JANELA_MS = 3000;
+var LOG_MAX = 80;
+
 var exitPromptOpen = false;
 var focoSaida = "sim";
 
@@ -79,6 +92,23 @@ var tentativasPrepare = 0;
 
 var timerStall = null;
 
+/*
+ * Ultimo percentual informado por onbufferingprogress. O watchdog de
+ * travamento so pode ser renovado quando este valor muda de fato; ver
+ * comentario em onbufferingprogress.
+ */
+var ultimoPercentBuffering = null;
+
+var diagAberto = false;
+var toquesDiag = 0;
+var ultimoToqueDiag = 0;
+var logRing = [];
+var infoPlataforma = {
+    tizen: "desconhecido",
+    modelo: "desconhecido",
+    firmware: "desconhecido"
+};
+
 var xhrConfigAtual = null;
 var timerConfig = null;
 var timerVideo = null;
@@ -88,7 +118,7 @@ var networkListenerId = null;
 /* Inicializacao                                                       */
 
 function init() {
-    console.log("SCTV-HD " + APP_VERSION + " iniciando.");
+    logInfo("SCTV-HD " + APP_VERSION + " iniciando.");
     logarInfoDaPlataforma();
 
     /* O controle deve funcionar mesmo se a rede ou o player falharem. */
@@ -108,7 +138,8 @@ function init() {
 }
 
 /*
- * Registra modelo e versao de firmware no console.
+ * Registra modelo e versao de firmware no log e guarda em infoPlataforma,
+ * para o painel de diagnostico mostrar.
  *
  * Util ao abrir um chamado 1:1 na Samsung: o time de review nao informa
  * em qual aparelho reproduziu a falha, e estes dados permitem comparar
@@ -117,26 +148,29 @@ function init() {
 function logarInfoDaPlataforma() {
     try {
         if (typeof tizen !== "undefined" && tizen.systeminfo) {
-            console.log("Tizen: " + tizen.systeminfo.getCapability("http://tizen.org/feature/platform.version"));
+            infoPlataforma.tizen = tizen.systeminfo.getCapability("http://tizen.org/feature/platform.version");
+            logInfo("Tizen: " + infoPlataforma.tizen);
         }
     } catch (e) {
-        console.warn("Versão da plataforma indisponível: " + mensagemErro(e));
+        logAviso("Versão da plataforma indisponível: " + mensagemErro(e));
     }
 
     try {
         if (webapisDisponivel() && webapis.productinfo) {
-            console.log("Modelo: " + webapis.productinfo.getRealModel());
-            console.log("Firmware: " + webapis.productinfo.getFirmware());
+            infoPlataforma.modelo = webapis.productinfo.getRealModel();
+            infoPlataforma.firmware = webapis.productinfo.getFirmware();
+            logInfo("Modelo: " + infoPlataforma.modelo);
+            logInfo("Firmware: " + infoPlataforma.firmware);
         }
     } catch (e) {
-        console.warn("Informações do produto indisponíveis: " + mensagemErro(e));
+        logAviso("Informações do produto indisponíveis: " + mensagemErro(e));
     }
 }
 
 /* Fluxo principal                                                     */
 
 function iniciarFluxo() {
-    if (!appVisivel || exitPromptOpen) {
+    if (!appVisivel) {
         return;
     }
 
@@ -149,7 +183,7 @@ function iniciarFluxo() {
 }
 
 function buscarConfiguracao() {
-    if (!appVisivel || exitPromptOpen) {
+    if (!appVisivel) {
         return;
     }
 
@@ -162,7 +196,7 @@ function buscarConfiguracao() {
     mostrarMensagem("Conectando à transmissão...");
 
     carregarUrlDaConfiguracao(function (streamingUrl, erro) {
-        if (!appVisivel || exitPromptOpen) {
+        if (!appVisivel) {
             return;
         }
 
@@ -170,7 +204,7 @@ function buscarConfiguracao() {
             tentativasConfig = 0;
 
             if (urlMasterOriginal !== streamingUrl) {
-                console.log("Nova URL de streaming recebida.");
+                logInfo("Nova URL de streaming recebida.");
 
                 /* URL diferente: recomeca do zero, sem herdar o fallback. */
                 urlMasterOriginal = streamingUrl;
@@ -178,13 +212,16 @@ function buscarConfiguracao() {
                 tentativasPrepare = 0;
             }
 
-            if (usandoPlaylistDeMidia && urlAtual) {
+            if (usandoPlaylistDeMidia) {
                 /*
-                 * Ja estamos usando a playlist de midia para esta mesma
-                 * transmissao; manter, em vez de voltar para a mestre
-                 * que acabou de falhar.
+                 * Seguimos com a playlist de midia para esta transmissao, em
+                 * vez de voltar para a mestre que acabou de falhar. Mas a
+                 * chunklist do Wowza tem nome por sessao
+                 * (chunklist_w<numero>.m3u8) e expira: reusar a URL anterior
+                 * deixaria o app em 404 permanente, entao ela e re-resolvida
+                 * a partir da mestre a cada ciclo.
                  */
-                iniciarVideo(urlAtual);
+                reabrirComPlaylistDeMidia(streamingUrl);
                 return;
             }
 
@@ -193,7 +230,7 @@ function buscarConfiguracao() {
             return;
         }
 
-        console.warn("Falha ao obter URL do streaming: " + (erro || "erro desconhecido"));
+        logAviso("Falha ao obter URL do streaming: " + (erro || "erro desconhecido"));
         agendarNovaBuscaDeConfiguracao();
     });
 }
@@ -305,23 +342,23 @@ function diagnosticarRede() {
         teste.timeout = 8000;
 
         teste.onload = function () {
-            console.error(
+            logErro(
                 "DIAG: rede OK (HTTP " + teste.status + "). " +
                 "A falha e especifica do endpoint de configuracao."
             );
         };
 
         teste.onerror = function () {
-            console.error("DIAG: sem saida para a internet neste aparelho.");
+            logErro("DIAG: sem saida para a internet neste aparelho.");
         };
 
         teste.ontimeout = function () {
-            console.error("DIAG: timeout no teste de rede.");
+            logErro("DIAG: timeout no teste de rede.");
         };
 
         teste.send();
     } catch (e) {
-        console.error("DIAG: falha ao executar teste de rede: " + mensagemErro(e));
+        logErro("DIAG: falha ao executar teste de rede: " + mensagemErro(e));
     }
 }
 
@@ -356,6 +393,31 @@ function extrairUrlDaResposta(response) {
 /* Playlist mestre -> playlist de midia                                */
 
 /*
+ * Re-resolve a chunklist a partir da playlist mestre e reabre o player com
+ * ela. Se a resolucao falhar, volta para a mestre em vez de insistir numa URL
+ * de sessao possivelmente morta.
+ */
+function reabrirComPlaylistDeMidia(masterUrl) {
+    resolverPlaylistDeMidia(masterUrl, function (mediaUrl) {
+        if (!appVisivel) {
+            return;
+        }
+
+        if (mediaUrl && urlDeStreamingValida(mediaUrl)) {
+            urlAtual = mediaUrl;
+            iniciarVideo(mediaUrl);
+            return;
+        }
+
+        logAviso("Playlist de mídia indisponível; voltando para a playlist mestre.");
+        usandoPlaylistDeMidia = false;
+        tentativasPrepare = 0;
+        urlAtual = masterUrl;
+        iniciarVideo(masterUrl);
+    });
+}
+
+/*
  * Le a playlist mestre e devolve a URL absoluta da primeira variante.
  *
  * Motivo: a playlist mestre desta transmissao aponta para um chunklist
@@ -377,12 +439,12 @@ function resolverPlaylistDeMidia(masterUrl, callback) {
             }
 
             if (xhr.status < 200 || xhr.status >= 300) {
-                console.warn("Não foi possível ler a playlist mestre: HTTP " + xhr.status);
+                logAviso("Não foi possível ler a playlist mestre: HTTP " + xhr.status);
                 callback(null);
                 return;
             }
 
-            callback(extrairPrimeiraVariante(xhr.responseText, masterUrl));
+            callback(extrairMelhorVariante(xhr.responseText, masterUrl));
         };
 
         xhr.ontimeout = function () {
@@ -395,16 +457,20 @@ function resolverPlaylistDeMidia(masterUrl, callback) {
 
         xhr.send();
     } catch (e) {
-        console.warn("Falha ao consultar a playlist mestre: " + mensagemErro(e));
+        logAviso("Falha ao consultar a playlist mestre: " + mensagemErro(e));
         callback(null);
     }
 }
 
-function extrairPrimeiraVariante(texto, baseUrl) {
+function extrairMelhorVariante(texto, baseUrl) {
     var conteudo = String(texto || "");
     var linhas;
     var linha;
     var i;
+    var achado;
+    var banda = -1;
+    var melhorBanda = -1;
+    var melhorUri = null;
 
     /*
      * Sem EXT-X-STREAM-INF isto ja e uma playlist de midia: as linhas
@@ -412,7 +478,7 @@ function extrairPrimeiraVariante(texto, baseUrl) {
      * player em vez de ajudar.
      */
     if (conteudo.indexOf("#EXT-X-STREAM-INF") === -1) {
-        console.warn("A URL já é uma playlist de mídia; nada a resolver.");
+        logAviso("A URL já é uma playlist de mídia; nada a resolver.");
         return null;
     }
 
@@ -421,14 +487,40 @@ function extrairPrimeiraVariante(texto, baseUrl) {
     for (i = 0; i < linhas.length; i++) {
         linha = linhas[i].replace(/^\s+|\s+$/g, "");
 
-        if (linha === "" || linha.charAt(0) === "#") {
+        if (linha === "") {
             continue;
         }
 
-        return resolverUrlRelativa(linha, baseUrl);
+        if (linha.indexOf("#EXT-X-STREAM-INF") === 0) {
+            achado = /BANDWIDTH=(\d+)/.exec(linha);
+            banda = achado ? parseInt(achado[1], 10) : 0;
+            continue;
+        }
+
+        if (linha.charAt(0) === "#") {
+            continue;
+        }
+
+        /*
+         * A primeira variante do Wowza e a de menor bitrate. Como o fallback
+         * desliga o ABR, pegar a primeira entregaria 426x240 numa TV 4K;
+         * escolhemos a de maior BANDWIDTH.
+         */
+        if (banda > melhorBanda) {
+            melhorBanda = banda;
+            melhorUri = linha;
+        }
+
+        banda = -1;
     }
 
-    return null;
+    if (melhorUri === null) {
+        return null;
+    }
+
+    logInfo("Variante escolhida: " + melhorBanda + " bps.");
+
+    return resolverUrlRelativa(melhorUri, baseUrl);
 }
 
 function resolverUrlRelativa(caminho, baseUrl) {
@@ -459,7 +551,15 @@ function urlDeStreamingValida(url) {
     }
 
     /* O app distribuido deve usar transporte seguro. */
-    return url.indexOf("https://") === 0;
+    if (url.indexOf("https://") !== 0) {
+        logErro(
+            "URL de streaming rejeitada: o app exige https:// e recebeu \"" +
+            url.substring(0, 12) + "...\". Corrija a configuração remota."
+        );
+        return false;
+    }
+
+    return true;
 }
 
 function abortarRequisicaoConfig() {
@@ -470,7 +570,7 @@ function abortarRequisicaoConfig() {
     try {
         xhrConfigAtual.abort();
     } catch (e) {
-        console.warn("Falha ao abortar requisição: " + mensagemErro(e));
+        logAviso("Falha ao abortar requisição: " + mensagemErro(e));
     }
 
     xhrConfigAtual = null;
@@ -482,12 +582,12 @@ function iniciarVideo(streamingUrl) {
     var minhaSessao;
     var timeoutPreparo = null;
 
-    if (!appVisivel || exitPromptOpen) {
+    if (!appVisivel) {
         return;
     }
 
     if (!webapisDisponivel() || !webapis.avplay) {
-        console.error("AVPlay não está disponível neste dispositivo.");
+        logErro("AVPlay não está disponível neste dispositivo.");
         mostrarMensagem("Não foi possível iniciar o player desta TV.");
         agendarReconexaoVideo("AVPlay indisponível");
         return;
@@ -504,7 +604,7 @@ function iniciarVideo(streamingUrl) {
     mostrarMensagem("Carregando transmissão...");
 
     try {
-        console.log("AVPlay.open()");
+        logInfo("AVPlay.open()");
         webapis.avplay.open(streamingUrl);
 
         webapis.avplay.setListener(criarListenerAVPlay(minhaSessao));
@@ -516,13 +616,13 @@ function iniciarVideo(streamingUrl) {
             webapis.avplay.setDisplayMethod("PLAYER_DISPLAY_MODE_LETTER_BOX");
         } catch (displayError) {
             /* Alguns firmwares antigos podem nao expor este metodo. */
-            console.warn("setDisplayMethod não aplicado: " + mensagemErro(displayError));
+            logAviso("setDisplayMethod não aplicado: " + mensagemErro(displayError));
         }
 
         try {
             webapis.avplay.setTimeoutForBuffering(15);
         } catch (bufferError) {
-            console.warn("Timeout de buffering não configurado: " + mensagemErro(bufferError));
+            logAviso("Timeout de buffering não configurado: " + mensagemErro(bufferError));
         }
 
         /*
@@ -542,7 +642,7 @@ function iniciarVideo(streamingUrl) {
                 return;
             }
 
-            console.error(
+            logErro(
                 "AVPlay.prepareAsync não respondeu em " +
                 (PREPARE_TIMEOUT_MS / 1000) + "s (nenhum callback disparou)."
             );
@@ -564,7 +664,7 @@ function iniciarVideo(streamingUrl) {
                 playerPreparando = false;
 
                 try {
-                    console.log("AVPlay preparado. Iniciando reprodução.");
+                    logInfo("AVPlay preparado. Iniciando reprodução.");
                     webapis.avplay.play();
                     playerReproduzindo = true;
                     tentativasVideo = 0;
@@ -572,7 +672,7 @@ function iniciarVideo(streamingUrl) {
                     esconderCarregamento();
                     definirScreensaver(false);
                 } catch (playError) {
-                    console.error("Falha em AVPlay.play(): " + mensagemErro(playError));
+                    logErro("Falha em AVPlay.play(): " + mensagemErro(playError));
                     agendarReconexaoVideo("falha ao iniciar reprodução");
                 }
             },
@@ -587,7 +687,7 @@ function iniciarVideo(streamingUrl) {
                 }
 
                 playerPreparando = false;
-                console.error("AVPlay.prepareAsync falhou: " + mensagemErro(error));
+                logErro("AVPlay.prepareAsync falhou: " + mensagemErro(error));
                 tratarFalhaDePreparo("falha ao preparar transmissão");
             }
         );
@@ -598,7 +698,7 @@ function iniciarVideo(streamingUrl) {
         }
         playerPreparando = false;
         playerReproduzindo = false;
-        console.error("Falha ao abrir AVPlay: " + mensagemErro(e));
+        logErro("Falha ao abrir AVPlay: " + mensagemErro(e));
         agendarReconexaoVideo("falha ao abrir transmissão");
     }
 }
@@ -610,8 +710,9 @@ function criarListenerAVPlay(sessao) {
                 return;
             }
 
-            console.log("AVPlay buffering iniciado.");
+            logInfo("AVPlay buffering iniciado.");
             mostrarMensagem("Carregando transmissão...");
+            ultimoPercentBuffering = null;
             armarTimerDeTravamento();
         },
 
@@ -620,13 +721,19 @@ function criarListenerAVPlay(sessao) {
                 return;
             }
 
-            console.log("AVPlay buffering: " + percent + "%");
+            logInfo("AVPlay buffering: " + percent + "%");
 
             /*
-             * Cada avanco real renova o prazo. Se o valor parar de mudar,
-             * o timer nao e renovado e o player e reiniciado.
+             * Somente um avanco real renova o prazo. Renovar a cada callback
+             * anularia a protecao exatamente no caso que ela existe para
+             * cobrir: firmwares Samsung que repetem o mesmo percentual
+             * indefinidamente. Com a renovacao incondicional o timer nunca
+             * vencia e o player nunca reiniciava.
              */
-            armarTimerDeTravamento();
+            if (percent !== ultimoPercentBuffering) {
+                ultimoPercentBuffering = percent;
+                armarTimerDeTravamento();
+            }
         },
 
         onbufferingcomplete: function () {
@@ -634,8 +741,18 @@ function criarListenerAVPlay(sessao) {
                 return;
             }
 
-            console.log("AVPlay buffering concluído.");
+            logInfo("AVPlay buffering concluído.");
             cancelarTimerDeTravamento();
+
+            /*
+             * onbufferingstart reexibe a camada de carregamento via
+             * mostrarMensagem. Sem esconde-la aqui, qualquer engasgo no meio
+             * da transmissao deixaria a tela de espera por cima do video para
+             * sempre, com o audio tocando: o player segue em PLAYING e
+             * oncurrentplaytime nao reesconde a camada por playerReproduzindo
+             * ja ser true.
+             */
+            esconderCarregamento();
         },
 
         onstreamcompleted: function () {
@@ -643,7 +760,7 @@ function criarListenerAVPlay(sessao) {
                 return;
             }
 
-            console.warn("AVPlay informou fim do stream.");
+            logAviso("AVPlay informou fim do stream.");
             agendarReconexaoVideo("stream encerrado");
         },
 
@@ -655,11 +772,17 @@ function criarListenerAVPlay(sessao) {
             /* Tempo de reproducao avancando: nao ha travamento. */
             cancelarTimerDeTravamento();
 
+            /*
+             * O tempo avancou, logo existe imagem: a camada de espera sai
+             * sempre, e nao apenas na primeira vez. Ver F1 em
+             * onbufferingcomplete.
+             */
+            esconderCarregamento();
+
             if (!playerReproduzindo) {
                 playerReproduzindo = true;
                 tentativasVideo = 0;
                 tentativasPrepare = 0;
-                esconderCarregamento();
                 definirScreensaver(false);
             }
         },
@@ -669,7 +792,12 @@ function criarListenerAVPlay(sessao) {
                 return;
             }
 
-            console.error("Erro AVPlay: " + eventType);
+            logErro(
+                "Erro AVPlay: " + eventType +
+                " | estado=" + estadoDoPlayer() +
+                " | playlist=" + (usandoPlaylistDeMidia ? "chunklist" : "mestre") +
+                " | url=" + (urlAtual || "nenhuma")
+            );
             agendarReconexaoVideo("erro do player: " + eventType);
         },
 
@@ -678,7 +806,7 @@ function criarListenerAVPlay(sessao) {
                 return;
             }
 
-            console.log("Evento AVPlay: " + eventType + " / " + eventData);
+            logInfo("Evento AVPlay: " + eventType + " / " + eventData);
         },
 
         onsubtitlechange: function () {
@@ -686,7 +814,7 @@ function criarListenerAVPlay(sessao) {
         },
 
         ondrmevent: function (drmEvent, drmData) {
-            console.log("Evento DRM: " + drmEvent + " / " + drmData);
+            logInfo("Evento DRM: " + drmEvent + " / " + drmData);
         }
     };
 }
@@ -701,22 +829,37 @@ function criarListenerAVPlay(sessao) {
 function tratarFalhaDePreparo(motivo) {
     tentativasPrepare++;
 
-    if (usandoPlaylistDeMidia ||
-        tentativasPrepare < MAX_PREPARE_ANTES_DE_FALLBACK ||
-        !urlMasterOriginal) {
+    if (usandoPlaylistDeMidia) {
+        if (tentativasPrepare >= MAX_PREPARE_ANTES_DE_FALLBACK) {
+            /*
+             * A chunklist tambem falhou. O nome dela e por sessao e expira,
+             * entao voltar para a mestre faz o proximo ciclo re-resolver tudo
+             * em vez de insistir numa URL morta.
+             */
+            logAviso("A playlist de mídia também falhou. Voltando para a playlist mestre.");
+            usandoPlaylistDeMidia = false;
+            tentativasPrepare = 0;
+            urlAtual = urlMasterOriginal;
+        }
+
         agendarReconexaoVideo(motivo);
         return;
     }
 
-    console.warn("Preparo falhou repetidamente. Tentando a playlist de mídia diretamente.");
+    if (tentativasPrepare < MAX_PREPARE_ANTES_DE_FALLBACK || !urlMasterOriginal) {
+        agendarReconexaoVideo(motivo);
+        return;
+    }
+
+    logAviso("Preparo falhou repetidamente. Tentando a playlist de mídia diretamente.");
 
     resolverPlaylistDeMidia(urlMasterOriginal, function (mediaUrl) {
-        if (!appVisivel || exitPromptOpen) {
+        if (!appVisivel) {
             return;
         }
 
         if (mediaUrl && urlDeStreamingValida(mediaUrl)) {
-            console.log("Playlist de mídia resolvida. Reabrindo o player com ela.");
+            logInfo("Playlist de mídia resolvida. Reabrindo o player com ela.");
             usandoPlaylistDeMidia = true;
             tentativasPrepare = 0;
             urlAtual = mediaUrl;
@@ -724,7 +867,7 @@ function tratarFalhaDePreparo(motivo) {
             return;
         }
 
-        console.warn("Não foi possível resolver a playlist de mídia.");
+        logAviso("Não foi possível resolver a playlist de mídia.");
         agendarReconexaoVideo(motivo);
     });
 }
@@ -732,7 +875,7 @@ function tratarFalhaDePreparo(motivo) {
 function agendarReconexaoVideo(motivo) {
     var atraso;
 
-    if (!appVisivel || exitPromptOpen) {
+    if (!appVisivel) {
         return;
     }
 
@@ -744,7 +887,7 @@ function agendarReconexaoVideo(motivo) {
     playerReproduzindo = false;
     tentativasVideo++;
 
-    console.warn("Reconexão solicitada: " + motivo + ". Tentativa " + tentativasVideo + ".");
+    logAviso("Reconexão solicitada: " + motivo + ". Tentativa " + tentativasVideo + ".");
 
     fecharPlayer();
     definirScreensaver(true);
@@ -790,7 +933,7 @@ function fecharPlayer() {
             webapis.avplay.stop();
         }
     } catch (stopError) {
-        console.warn("AVPlay.stop ignorado: " + mensagemErro(stopError));
+        logAviso("AVPlay.stop ignorado: " + mensagemErro(stopError));
     }
 
     try {
@@ -798,7 +941,7 @@ function fecharPlayer() {
         webapis.avplay.close();
     } catch (closeError) {
         /* Se ja estiver NONE, alguns firmwares lançam InvalidStateError. */
-        console.warn("AVPlay.close ignorado: " + mensagemErro(closeError));
+        logAviso("AVPlay.close ignorado: " + mensagemErro(closeError));
     }
 }
 
@@ -812,10 +955,10 @@ function pausarVideo() {
             webapis.avplay.pause();
             playerReproduzindo = false;
             definirScreensaver(true);
-            console.log("Reprodução pausada pelo controle remoto.");
+            logInfo("Reprodução pausada pelo controle remoto.");
         }
     } catch (e) {
-        console.warn("Não foi possível pausar: " + mensagemErro(e));
+        logAviso("Não foi possível pausar: " + mensagemErro(e));
     }
 }
 
@@ -830,10 +973,10 @@ function retomarVideo() {
             playerReproduzindo = true;
             esconderCarregamento();
             definirScreensaver(false);
-            console.log("Reprodução retomada pelo controle remoto.");
+            logInfo("Reprodução retomada pelo controle remoto.");
         }
     } catch (e) {
-        console.warn("Não foi possível retomar: " + mensagemErro(e));
+        logAviso("Não foi possível retomar: " + mensagemErro(e));
     }
 }
 
@@ -853,7 +996,7 @@ function alternarPlayPause() {
             retomarVideo();
         }
     } catch (e) {
-        console.warn("Não foi possível alternar Play/Pause: " + mensagemErro(e));
+        logAviso("Não foi possível alternar Play/Pause: " + mensagemErro(e));
     }
 }
 
@@ -861,13 +1004,13 @@ function alternarPlayPause() {
 
 function configurarMonitoramentoDeRede() {
     if (!webapisDisponivel() || !webapis.network) {
-        console.warn("Network API indisponível; o app seguirá usando erros das requisições/player.");
+        logAviso("Network API indisponível; o app seguirá usando erros das requisições/player.");
         return;
     }
 
     try {
         networkListenerId = webapis.network.addNetworkStateChangeListener(function (value) {
-            console.log("Network state: " + value);
+            logInfo("Network state: " + value);
 
             if (value === webapis.network.NetworkState.GATEWAY_DISCONNECTED) {
                 redeConectada = false;
@@ -878,7 +1021,7 @@ function configurarMonitoramentoDeRede() {
             }
         });
     } catch (e) {
-        console.warn("Monitoramento de rede não configurado: " + mensagemErro(e));
+        logAviso("Monitoramento de rede não configurado: " + mensagemErro(e));
     }
 }
 
@@ -891,7 +1034,7 @@ function verificarRedeAtual() {
         redeConectada = webapis.network.isConnectedToGateway();
         return redeConectada;
     } catch (e) {
-        console.warn("Não foi possível consultar o gateway: " + mensagemErro(e));
+        logAviso("Não foi possível consultar o gateway: " + mensagemErro(e));
         return redeConectada;
     }
 }
@@ -905,7 +1048,7 @@ function tratarRedeDesconectada() {
 }
 
 function tratarRedeReconectada() {
-    if (!appVisivel || exitPromptOpen) {
+    if (!appVisivel) {
         return;
     }
 
@@ -918,7 +1061,7 @@ function tratarRedeReconectada() {
 function configurarMultitarefa() {
     document.addEventListener("visibilitychange", function () {
         if (document.hidden) {
-            console.log("Aplicativo em segundo plano.");
+            logInfo("Aplicativo em segundo plano.");
             appVisivel = false;
 
             cancelarTimers();
@@ -926,7 +1069,7 @@ function configurarMultitarefa() {
             fecharPlayer();
             definirScreensaver(true);
         } else {
-            console.log("Aplicativo retornou ao primeiro plano.");
+            logInfo("Aplicativo retornou ao primeiro plano.");
             appVisivel = true;
 
             /* A Samsung recomenda verificar a rede antes de retomar streaming. */
@@ -969,11 +1112,11 @@ function definirScreensaver(ligado) {
             estado,
             function () {},
             function (error) {
-                console.warn("Erro ao alterar screensaver: " + mensagemErro(error));
+                logAviso("Erro ao alterar screensaver: " + mensagemErro(error));
             }
         );
     } catch (e) {
-        console.warn("Screensaver não ajustado: " + mensagemErro(e));
+        logAviso("Screensaver não ajustado: " + mensagemErro(e));
     }
 }
 
@@ -988,6 +1131,8 @@ function configurarControleRemoto() {
 
         if (exitPromptOpen) {
             tratado = tratarTeclaNoPopup(keyCode);
+        } else if (diagAberto) {
+            tratado = tratarTeclaNoDiagnostico(keyCode);
         } else {
             switch (keyCode) {
                 case KEY_BACK:
@@ -1010,8 +1155,13 @@ function configurarControleRemoto() {
                     tratado = true;
                     break;
 
+                case KEY_UP:
+                    contarToqueDeDiagnostico();
+                    tratado = true;
+                    break;
+
                 default:
-                    console.log("Key code: " + keyCode);
+                    logInfo("Key code: " + keyCode);
                     break;
             }
         }
@@ -1044,13 +1194,13 @@ function registrarTeclasDeMidia() {
         for (i = 0; i < teclas.length; i++) {
             try {
                 tizen.tvinputdevice.registerKey(teclas[i]);
-                console.log("Tecla registrada: " + teclas[i]);
+                logInfo("Tecla registrada: " + teclas[i]);
             } catch (keyError) {
-                console.warn("Tecla não registrada (" + teclas[i] + "): " + mensagemErro(keyError));
+                logAviso("Tecla não registrada (" + teclas[i] + "): " + mensagemErro(keyError));
             }
         }
     } catch (e) {
-        console.warn("TVInputDevice indisponível: " + mensagemErro(e));
+        logAviso("TVInputDevice indisponível: " + mensagemErro(e));
     }
 }
 
@@ -1123,6 +1273,17 @@ function fecharPopupDeSaida() {
     }
 
     exitPromptOpen = false;
+
+    /*
+     * Rede de seguranca: o popup nao interrompe mais a reconexao, mas se o
+     * app chegar aqui sem player tocando e sem nada agendado, nada voltaria a
+     * acontecer. Religar o fluxo evita ficar parado numa mensagem para sempre.
+     */
+    if (!playerReproduzindo && !playerPreparando &&
+        timerVideo === null && timerConfig === null && timerRetomar === null) {
+        logAviso("Popup fechado sem reprodução nem reconexão pendente. Religando o fluxo.");
+        agendarRetomada(500);
+    }
 }
 
 function atualizarFocoSaida() {
@@ -1138,7 +1299,7 @@ function atualizarFocoSaida() {
 }
 
 function sairDoAplicativo() {
-    console.log("Saindo do SCTV-HD.");
+    logInfo("Saindo do SCTV-HD.");
 
     cancelarTimers();
     abortarRequisicaoConfig();
@@ -1150,8 +1311,90 @@ function sairDoAplicativo() {
             tizen.application.getCurrentApplication().exit();
         }
     } catch (e) {
-        console.error("Erro ao sair do aplicativo: " + mensagemErro(e));
+        logErro("Erro ao sair do aplicativo: " + mensagemErro(e));
         exitPromptOpen = false;
+    }
+}
+
+/* Diagnostico                                                         */
+
+function contarToqueDeDiagnostico() {
+    var agora = new Date().getTime();
+
+    if (agora - ultimoToqueDiag > DIAG_JANELA_MS) {
+        toquesDiag = 0;
+    }
+
+    ultimoToqueDiag = agora;
+    toquesDiag++;
+
+    if (toquesDiag >= DIAG_TOQUES) {
+        toquesDiag = 0;
+        abrirDiagnostico();
+    }
+}
+
+function tratarTeclaNoDiagnostico(keyCode) {
+    switch (keyCode) {
+        case KEY_BACK:
+        case KEY_ENTER:
+            fecharDiagnostico();
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+function abrirDiagnostico() {
+    var painel = document.getElementById("diagPanel");
+    var cabecalho = document.getElementById("diagCabecalho");
+    var registro = document.getElementById("diagLog");
+
+    if (!painel) {
+        return;
+    }
+
+    if (cabecalho) {
+        cabecalho.innerHTML = escaparHtml(
+            "Versão " + APP_VERSION +
+            "   Tizen " + infoPlataforma.tizen +
+            "   Modelo " + infoPlataforma.modelo +
+            "   Firmware " + infoPlataforma.firmware + "\n" +
+            "Player " + estadoDoPlayer() +
+            "   Playlist " + (usandoPlaylistDeMidia ? "chunklist" : "mestre") +
+            "   Rede " + (redeConectada ? "ok" : "sem conexão") + "\n" +
+            "URL " + (urlAtual || "nenhuma")
+        );
+    }
+
+    if (registro) {
+        registro.innerHTML = escaparHtml(logRing.join("\n"));
+    }
+
+    diagAberto = true;
+    removerClasse(painel, "hidden");
+}
+
+function fecharDiagnostico() {
+    var painel = document.getElementById("diagPanel");
+
+    if (painel) {
+        adicionarClasse(painel, "hidden");
+    }
+
+    diagAberto = false;
+}
+
+function estadoDoPlayer() {
+    if (!webapisDisponivel() || !webapis.avplay) {
+        return "AVPLAY_INDISPONIVEL";
+    }
+
+    try {
+        return webapis.avplay.getState();
+    } catch (e) {
+        return "DESCONHECIDO";
     }
 }
 
@@ -1180,6 +1423,41 @@ function esconderCarregamento() {
 
 /* Utilitarios                                                         */
 
+/*
+ * Todo log do app passa por aqui: alem do console (que exige o inspetor
+ * remoto), as linhas ficam num buffer circular que o painel de diagnostico
+ * mostra na propria TV.
+ */
+function registrarLog(nivel, texto) {
+    var agora = new Date();
+
+    logRing.push(
+        ("0" + agora.getHours()).slice(-2) + ":" +
+        ("0" + agora.getMinutes()).slice(-2) + ":" +
+        ("0" + agora.getSeconds()).slice(-2) +
+        " " + nivel + " " + texto
+    );
+
+    if (logRing.length > LOG_MAX) {
+        logRing.shift();
+    }
+}
+
+function logInfo(texto) {
+    registrarLog("I", texto);
+    console.log(texto);
+}
+
+function logAviso(texto) {
+    registrarLog("A", texto);
+    console.warn(texto);
+}
+
+function logErro(texto) {
+    registrarLog("E", texto);
+    console.error(texto);
+}
+
 function webapisDisponivel() {
     return typeof webapis !== "undefined";
 }
@@ -1204,11 +1482,11 @@ function armarTimerDeTravamento() {
     timerStall = setTimeout(function () {
         timerStall = null;
 
-        if (!appVisivel || exitPromptOpen) {
+        if (!appVisivel) {
             return;
         }
 
-        console.error(
+        logErro(
             "Buffering parado por mais de " + (STALL_TIMEOUT_MS / 1000) +
             "s sem avançar. Reiniciando o player."
         );

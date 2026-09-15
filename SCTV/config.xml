@@ -2,7 +2,7 @@
 <widget xmlns="http://www.w3.org/ns/widgets"
         xmlns:tizen="http://tizen.org/ns/widgets"
         id="http://yourdomain/SantaCeciliaTV"
-        version="0.6.2"
+        version="0.6.3"
         viewmodes="maximized">
 
     <!--
