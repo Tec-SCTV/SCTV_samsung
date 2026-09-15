@@ -1008,22 +1008,38 @@ function pausarVideo() {
     }
 }
 
+/*
+ * Retoma SEMPRE na borda viva, reabrindo o stream.
+ *
+ * Requisito de certificacao da Samsung, defeito DF-260909-75243 na 0.6.2
+ * (24TV_PREMIUM5_LIC, Tizen 8.0): "If you pause while playing live content,
+ * you must import a recent live." O avplay.play() sobre um player em PAUSED
+ * retoma de dentro do buffer, ou seja, atras do ao vivo pelo tempo que a
+ * pausa durou -- exatamente o que foi reprovado.
+ *
+ * Reabrir resolve porque uma playlist HLS ao vivo comeca proxima ao fim:
+ * iniciarVideo() fecha o player e re-prepara, e o ponto de partida passa a
+ * ser o ao vivo atual. iniciarVideo() tambem mostra a camada de espera
+ * enquanto prepara, entao o usuario recebe retorno visual da troca.
+ */
 function retomarVideo() {
     if (!webapisDisponivel() || !webapis.avplay) {
         return;
     }
 
-    try {
-        if (webapis.avplay.getState() === "PAUSED") {
-            webapis.avplay.play();
-            playerReproduzindo = true;
-            esconderCarregamento();
-            definirScreensaver(false);
-            logInfo("Reprodução retomada pelo controle remoto.");
-        }
-    } catch (e) {
-        logAviso("Não foi possível retomar: " + mensagemErro(e));
+    if (estadoDoPlayer() !== "PAUSED") {
+        return;
     }
+
+    if (!urlAtual && !urlMasterOriginal) {
+        /* Sem URL conhecida nao ha o que reabrir; refaz o fluxo do zero. */
+        logAviso("Retomada sem URL conhecida; reiniciando o fluxo.");
+        iniciarFluxo();
+        return;
+    }
+
+    logInfo("Retomando na borda viva: reabrindo o stream em vez de dar play.");
+    iniciarVideo(urlAtual || urlMasterOriginal);
 }
 
 function alternarPlayPause() {
