@@ -45,6 +45,15 @@ var STALL_TIMEOUT_MS = 25000;
  */
 var MAX_PREPARE_ANTES_DE_FALLBACK = 2;
 
+/*
+ * Teto para a variante escolhida no fallback. O fallback desliga o ABR, entao
+ * a rendition escolhida e definitiva: sem teto, um encoder publicando 4K
+ * travaria os modelos de entrada da frota (o app cobre Tizen 6.0 a 9.0) e
+ * qualquer rede apertada, sem o player poder descer sozinho.
+ */
+var MAX_BANDWIDTH_FALLBACK = 3000000;
+var MAX_ALTURA_FALLBACK = 1080;
+
 var KEY_LEFT = 37;
 var KEY_UP = 38;
 var KEY_RIGHT = 39;
@@ -469,8 +478,11 @@ function extrairMelhorVariante(texto, baseUrl) {
     var i;
     var achado;
     var banda = -1;
+    var altura = 0;
     var melhorBanda = -1;
     var melhorUri = null;
+    var menorBanda = -1;
+    var menorUri = null;
 
     /*
      * Sem EXT-X-STREAM-INF isto ja e uma playlist de midia: as linhas
@@ -494,6 +506,9 @@ function extrairMelhorVariante(texto, baseUrl) {
         if (linha.indexOf("#EXT-X-STREAM-INF") === 0) {
             achado = /BANDWIDTH=(\d+)/.exec(linha);
             banda = achado ? parseInt(achado[1], 10) : 0;
+
+            achado = /RESOLUTION=\d+x(\d+)/.exec(linha);
+            altura = achado ? parseInt(achado[1], 10) : 0;
             continue;
         }
 
@@ -501,21 +516,45 @@ function extrairMelhorVariante(texto, baseUrl) {
             continue;
         }
 
+        /* Guardada como rede de seguranca caso nada caiba no teto. */
+        if (menorBanda === -1 || banda < menorBanda) {
+            menorBanda = banda;
+            menorUri = linha;
+        }
+
         /*
-         * A primeira variante do Wowza e a de menor bitrate. Como o fallback
-         * desliga o ABR, pegar a primeira entregaria 426x240 numa TV 4K;
-         * escolhemos a de maior BANDWIDTH.
+         * A primeira variante do Wowza e a de menor bitrate, e este fallback
+         * desliga o ABR: pegar a primeira entregaria 426x240 numa TV 4K, e
+         * pegar a maior poderia engasgar num modelo de entrada de 2021 ou numa
+         * rede apertada, sem o player poder descer sozinho. Escolhemos a maior
+         * que ainda caiba no teto.
          */
-        if (banda > melhorBanda) {
+        if (banda <= MAX_BANDWIDTH_FALLBACK &&
+            altura <= MAX_ALTURA_FALLBACK &&
+            banda > melhorBanda) {
             melhorBanda = banda;
             melhorUri = linha;
         }
 
         banda = -1;
+        altura = 0;
     }
 
     if (melhorUri === null) {
-        return null;
+        if (menorUri === null) {
+            return null;
+        }
+
+        /*
+         * Todas as renditions passam do teto (encoder so publicando 4K, por
+         * exemplo). A de menor banda e a aposta mais segura.
+         */
+        logAviso(
+            "Nenhuma variante dentro do teto de " + MAX_BANDWIDTH_FALLBACK +
+            " bps; usando a de menor banda (" + menorBanda + " bps)."
+        );
+
+        return resolverUrlRelativa(menorUri, baseUrl);
     }
 
     logInfo("Variante escolhida: " + melhorBanda + " bps.");
@@ -917,6 +956,13 @@ function fecharPlayer() {
     playerPreparando = false;
     playerReproduzindo = false;
     cancelarTimerDeTravamento();
+
+    /*
+     * Fecha o recorte antes de esvaziar o plano de video. Sem isto haveria uma
+     * janela entre este close() e o mostrarMensagem() de quem chamou em que a
+     * tela ficaria transparente sobre um plano de video vazio.
+     */
+    marcarPlanoDeVideo(false);
 
     if (!webapisDisponivel() || !webapis.avplay) {
         return;
@@ -1411,6 +1457,9 @@ function mostrarMensagem(texto) {
     if (mensagem) {
         mensagem.innerHTML = escaparHtml(texto);
     }
+
+    /* Camada opaca na frente: o recorte do plano de video nao serve para nada. */
+    marcarPlanoDeVideo(false);
 }
 
 function esconderCarregamento() {
@@ -1418,6 +1467,26 @@ function esconderCarregamento() {
 
     if (loadingLayer) {
         adicionarClasse(loadingLayer, "hidden");
+    }
+
+    /* Sem camada opaca na frente: abre o recorte para o plano de video. */
+    marcarPlanoDeVideo(true);
+}
+
+/*
+ * Liga e desliga a transparencia do body. A invariante e simples: o body fica
+ * transparente exatamente quando nenhuma camada opaca cobre a tela E o plano
+ * de video tem conteudo. Ver comentario em css/style.css.
+ */
+function marcarPlanoDeVideo(visivel) {
+    if (!document.body) {
+        return;
+    }
+
+    if (visivel) {
+        adicionarClasse(document.body, "tocando");
+    } else {
+        removerClasse(document.body, "tocando");
     }
 }
 
