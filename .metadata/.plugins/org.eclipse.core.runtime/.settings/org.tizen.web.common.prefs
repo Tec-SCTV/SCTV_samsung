@@ -1,0 +1,2 @@
+EXTRA_PARAM=--no-first-run --activate-on-launch --no-default-browser-check --allow-file-access-from-files --disable-web-security --disable-translate --proxy-auto-detect --proxy-bypass-list\=127.0.0.1 --enable-blink-features\=ShadowDOMV0 --enable-blink-features\=ShadowDOMV0 --enable-blink-features\=CustomElementsV0 --user-data-dir\=/tmp/ttt 
+eclipse.preferences.version=1

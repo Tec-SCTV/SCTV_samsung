@@ -1,0 +1,4 @@
+eclipse.preferences.version=1
+installerLogFileName=%X{userdata_log}/ide-%d{yyyyMMdd}_%d{HHmmss}.log
+loggerLevel=ERROR
+loggerPattern=[%d{yyyy.MM.dd HH\:mm\:ss}][%-5p] %F(%L) - %m%n

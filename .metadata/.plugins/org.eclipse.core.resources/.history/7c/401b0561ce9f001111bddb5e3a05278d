@@ -1,0 +1,1034 @@
+/* global webapis, tizen */
+
+var APP_VERSION = "0.6.1";
+
+/*
+ * O parser abaixo tambem entende respostas simples de Worker:
+ *   { "url": "https://...m3u8" }
+ * ou
+ *   { "streaming_url": "https://...m3u8" }
+ *
+ * Portanto, no futuro, para trocar o Firestore REST por um Worker,
+ * basta alterar CONFIG_ENDPOINT; o restante do app nao precisa mudar.
+ */
+var FIREBASE_PROJECT_ID = "sctv-hd";
+var FIREBASE_API_KEY = "AIzaSyDyMDLNk8Uow3tBS7sQt1mbZXp0KW9V1rE";
+var FIRESTORE_DOCUMENT_PATH = "configs/sctv_samsung";
+var FIRESTORE_FIELD_NAME = "streaming_url";
+
+var CONFIG_ENDPOINT =
+    "https://firestore.googleapis.com/v1/projects/" +
+    FIREBASE_PROJECT_ID +
+    "/databases/(default)/documents/" +
+    FIRESTORE_DOCUMENT_PATH +
+    "?key=" +
+    encodeURIComponent(FIREBASE_API_KEY);
+
+var REQUEST_TIMEOUT_MS = 15000;
+var PREPARE_TIMEOUT_MS = 20000;
+var RETRY_CURTO_MS = 4000;
+var RETRY_LONGO_MS = 30000;
+var MAX_TENTATIVAS_CONFIG_CURTAS = 4;
+var MAX_TENTATIVAS_VIDEO_CURTAS = 5;
+
+var KEY_LEFT = 37;
+var KEY_UP = 38;
+var KEY_RIGHT = 39;
+var KEY_DOWN = 40;
+var KEY_ENTER = 13;
+var KEY_BACK = 10009;
+var KEY_MEDIA_PLAY_PAUSE = 10252;
+var KEY_MEDIA_PLAY = 415;
+var KEY_MEDIA_PAUSE = 19;
+
+var exitPromptOpen = false;
+var focoSaida = "sim";
+
+var appVisivel = true;
+var redeConectada = true;
+var playerPreparando = false;
+var playerReproduzindo = false;
+var playerSessionId = 0;
+
+var urlAtual = null;
+var tentativasConfig = 0;
+var tentativasVideo = 0;
+
+var xhrConfigAtual = null;
+var timerConfig = null;
+var timerVideo = null;
+var timerRetomar = null;
+var networkListenerId = null;
+
+/* Inicializacao                                                       */
+
+function init() {
+    console.log("SCTV-HD " + APP_VERSION + " iniciando.");
+
+    /* O controle deve funcionar mesmo se a rede ou o player falharem. */
+    configurarControleRemoto();
+    configurarBotoesDoPopup();
+
+    configurarMonitoramentoDeRede();
+    configurarMultitarefa();
+
+    definirScreensaver(true);
+
+    if (verificarRedeAtual()) {
+        iniciarFluxo();
+    } else {
+        mostrarMensagem("Sem conexão com a internet. Verifique a rede da TV.");
+    }
+}
+
+/* Fluxo principal                                                     */
+
+function iniciarFluxo() {
+    if (!appVisivel || exitPromptOpen) {
+        return;
+    }
+
+    cancelarTimerConfig();
+    cancelarTimerVideo();
+    abortarRequisicaoConfig();
+
+    tentativasConfig = 0;
+    buscarConfiguracao();
+}
+
+function buscarConfiguracao() {
+    if (!appVisivel || exitPromptOpen) {
+        return;
+    }
+
+    if (!verificarRedeAtual()) {
+        mostrarMensagem("Sem conexão com a internet. Verifique a rede da TV.");
+        return;
+    }
+
+    tentativasConfig++;
+    mostrarMensagem("Conectando à transmissão...");
+
+    carregarUrlDaConfiguracao(function (streamingUrl, erro) {
+        if (!appVisivel || exitPromptOpen) {
+            return;
+        }
+
+        if (streamingUrl) {
+            tentativasConfig = 0;
+
+            if (urlAtual !== streamingUrl) {
+                console.log("Nova URL de streaming recebida.");
+            }
+
+            urlAtual = streamingUrl;
+            iniciarVideo(streamingUrl);
+            return;
+        }
+
+        console.warn("Falha ao obter URL do streaming: " + (erro || "erro desconhecido"));
+        agendarNovaBuscaDeConfiguracao();
+    });
+}
+
+function agendarNovaBuscaDeConfiguracao() {
+    var atraso;
+
+    cancelarTimerConfig();
+
+    if (tentativasConfig < MAX_TENTATIVAS_CONFIG_CURTAS) {
+        atraso = RETRY_CURTO_MS;
+        mostrarMensagem("Conectando à transmissão...");
+    } else {
+        /* Depois das tentativas rapidas, continua tentando sem travar o app. */
+        atraso = RETRY_LONGO_MS;
+        tentativasConfig = 0;
+        mostrarMensagem("Não foi possível carregar a transmissão. Tentaremos novamente automaticamente.");
+    }
+
+    timerConfig = setTimeout(function () {
+        timerConfig = null;
+        buscarConfiguracao();
+    }, atraso);
+}
+
+/* Configuracao remota (Firestore REST ou Worker JSON)                 */
+
+function carregarUrlDaConfiguracao(callback) {
+    var xhr = new XMLHttpRequest();
+    var finalizado = false;
+
+    abortarRequisicaoConfig();
+    xhrConfigAtual = xhr;
+
+    function finalizar(url, erro) {
+        if (finalizado) {
+            return;
+        }
+
+        finalizado = true;
+
+        if (xhrConfigAtual === xhr) {
+            xhrConfigAtual = null;
+        }
+
+        callback(url, erro);
+    }
+
+    try {
+        xhr.open("GET", CONFIG_ENDPOINT, true);
+        xhr.timeout = REQUEST_TIMEOUT_MS;
+
+        xhr.onreadystatechange = function () {
+            var response;
+            var streamingUrl;
+
+            if (xhr.readyState !== 4) {
+                return;
+            }
+
+            if (xhr.status >= 200 && xhr.status < 300) {
+                try {
+                    response = JSON.parse(xhr.responseText);
+                    streamingUrl = extrairUrlDaResposta(response);
+
+                    if (urlDeStreamingValida(streamingUrl)) {
+                        finalizar(streamingUrl, null);
+                    } else {
+                        finalizar(null, "URL ausente ou inválida na configuração");
+                    }
+                } catch (e) {
+                    finalizar(null, "JSON inválido: " + mensagemErro(e));
+                }
+            } else {
+                finalizar(null, "HTTP " + xhr.status);
+            }
+        };
+
+        xhr.ontimeout = function () {
+            finalizar(null, "timeout ao consultar configuração");
+        };
+
+        xhr.onerror = function () {
+            /*
+             * onerror so dispara quando nao houve resposta HTTP nenhuma.
+             * O teste abaixo separa "endpoint bloqueado" de "aparelho sem rede".
+             * Pode ser removido depois que a causa for identificada.
+             */
+            diagnosticarRede();
+            finalizar(null, "erro de rede ao consultar configuração");
+        };
+
+        xhr.onabort = function () {
+            /* Abort e usado durante pausa, saida ou reinicio do fluxo. */
+            finalizado = true;
+        };
+
+        xhr.send();
+    } catch (e) {
+        finalizar(null, "falha ao iniciar requisição: " + mensagemErro(e));
+    }
+}
+
+function diagnosticarRede() {
+    var teste = new XMLHttpRequest();
+
+    try {
+        teste.open("GET", "https://www.gstatic.com/generate_204", true);
+        teste.timeout = 8000;
+
+        teste.onload = function () {
+            console.error(
+                "DIAG: rede OK (HTTP " + teste.status + "). " +
+                "A falha e especifica do endpoint de configuracao."
+            );
+        };
+
+        teste.onerror = function () {
+            console.error("DIAG: sem saida para a internet neste aparelho.");
+        };
+
+        teste.ontimeout = function () {
+            console.error("DIAG: timeout no teste de rede.");
+        };
+
+        teste.send();
+    } catch (e) {
+        console.error("DIAG: falha ao executar teste de rede: " + mensagemErro(e));
+    }
+}
+
+function extrairUrlDaResposta(response) {
+    var field;
+
+    if (!response) {
+        return null;
+    }
+
+    /* Formato simples recomendado para um futuro Cloudflare Worker. */
+    if (typeof response.url === "string") {
+        return response.url;
+    }
+
+    if (typeof response.streaming_url === "string") {
+        return response.streaming_url;
+    }
+
+    /* Formato REST nativo do Firestore usado pela 0.5.9. */
+    if (response.fields && response.fields[FIRESTORE_FIELD_NAME]) {
+        field = response.fields[FIRESTORE_FIELD_NAME];
+
+        if (typeof field.stringValue === "string") {
+            return field.stringValue;
+        }
+    }
+
+    return null;
+}
+
+function urlDeStreamingValida(url) {
+    if (typeof url !== "string" || url.length < 8) {
+        return false;
+    }
+
+    /* O app distribuido deve usar transporte seguro. */
+    return url.indexOf("https://") === 0;
+}
+
+function abortarRequisicaoConfig() {
+    if (!xhrConfigAtual) {
+        return;
+    }
+
+    try {
+        xhrConfigAtual.abort();
+    } catch (e) {
+        console.warn("Falha ao abortar requisição: " + mensagemErro(e));
+    }
+
+    xhrConfigAtual = null;
+}
+
+/* AVPlay                                                              */
+
+function iniciarVideo(streamingUrl) {
+    var minhaSessao;
+    var timeoutPreparo = null;
+
+    if (!appVisivel || exitPromptOpen) {
+        return;
+    }
+
+    if (!webapisDisponivel() || !webapis.avplay) {
+        console.error("AVPlay não está disponível neste dispositivo.");
+        mostrarMensagem("Não foi possível iniciar o player desta TV.");
+        agendarReconexaoVideo("AVPlay indisponível");
+        return;
+    }
+
+    cancelarTimerVideo();
+    fecharPlayer();
+
+    playerSessionId++;
+    minhaSessao = playerSessionId;
+    playerPreparando = true;
+    playerReproduzindo = false;
+
+    mostrarMensagem("Carregando transmissão...");
+
+    try {
+        console.log("AVPlay.open()");
+        webapis.avplay.open(streamingUrl);
+
+        webapis.avplay.setListener(criarListenerAVPlay(minhaSessao));
+
+        /* AVPlay sempre usa coordenadas baseadas em 1920x1080. */
+        webapis.avplay.setDisplayRect(0, 0, 1920, 1080);
+
+        try {
+            webapis.avplay.setDisplayMethod("PLAYER_DISPLAY_MODE_LETTER_BOX");
+        } catch (displayError) {
+            /* Alguns firmwares antigos podem nao expor este metodo. */
+            console.warn("setDisplayMethod não aplicado: " + mensagemErro(displayError));
+        }
+
+        try {
+            webapis.avplay.setTimeoutForBuffering(15);
+        } catch (bufferError) {
+            console.warn("Timeout de buffering não configurado: " + mensagemErro(bufferError));
+        }
+
+        /*
+         * Watchdog do prepareAsync.
+         *
+         * Firmwares Samsung tem casos conhecidos em que prepareAsync() nunca
+         * chama nenhum dos dois callbacks para certos streams HLS: nem
+         * sucesso, nem erro, sem log algum. Sem isto, o app fica preso na
+         * tela "Carregando transmissão..." para sempre. setTimeoutForBuffering
+         * nao ajuda aqui: ele cobre engasgos durante a reproducao, nao esta
+         * fase inicial de preparo.
+         */
+        timeoutPreparo = setTimeout(function () {
+            timeoutPreparo = null;
+
+            if (minhaSessao !== playerSessionId || !appVisivel) {
+                return;
+            }
+
+            console.error(
+                "AVPlay.prepareAsync não respondeu em " +
+                (PREPARE_TIMEOUT_MS / 1000) + "s (nenhum callback disparou)."
+            );
+            playerPreparando = false;
+            agendarReconexaoVideo("timeout ao preparar transmissão");
+        }, PREPARE_TIMEOUT_MS);
+
+        webapis.avplay.prepareAsync(
+            function () {
+                if (timeoutPreparo !== null) {
+                    clearTimeout(timeoutPreparo);
+                    timeoutPreparo = null;
+                }
+
+                if (minhaSessao !== playerSessionId || !appVisivel) {
+                    return;
+                }
+
+                playerPreparando = false;
+
+                try {
+                    console.log("AVPlay preparado. Iniciando reprodução.");
+                    webapis.avplay.play();
+                    playerReproduzindo = true;
+                    tentativasVideo = 0;
+                    esconderCarregamento();
+                    definirScreensaver(false);
+                } catch (playError) {
+                    console.error("Falha em AVPlay.play(): " + mensagemErro(playError));
+                    agendarReconexaoVideo("falha ao iniciar reprodução");
+                }
+            },
+            function (error) {
+                if (timeoutPreparo !== null) {
+                    clearTimeout(timeoutPreparo);
+                    timeoutPreparo = null;
+                }
+
+                if (minhaSessao !== playerSessionId) {
+                    return;
+                }
+
+                playerPreparando = false;
+                console.error("AVPlay.prepareAsync falhou: " + mensagemErro(error));
+                agendarReconexaoVideo("falha ao preparar transmissão");
+            }
+        );
+    } catch (e) {
+        if (timeoutPreparo !== null) {
+            clearTimeout(timeoutPreparo);
+            timeoutPreparo = null;
+        }
+        playerPreparando = false;
+        playerReproduzindo = false;
+        console.error("Falha ao abrir AVPlay: " + mensagemErro(e));
+        agendarReconexaoVideo("falha ao abrir transmissão");
+    }
+}
+
+function criarListenerAVPlay(sessao) {
+    return {
+        onbufferingstart: function () {
+            if (sessao !== playerSessionId) {
+                return;
+            }
+
+            console.log("AVPlay buffering iniciado.");
+            mostrarMensagem("Carregando transmissão...");
+        },
+
+        onbufferingprogress: function (percent) {
+            if (sessao !== playerSessionId) {
+                return;
+            }
+
+            console.log("AVPlay buffering: " + percent + "%");
+        },
+
+        onbufferingcomplete: function () {
+            if (sessao !== playerSessionId) {
+                return;
+            }
+
+            console.log("AVPlay buffering concluído.");
+        },
+
+        onstreamcompleted: function () {
+            if (sessao !== playerSessionId) {
+                return;
+            }
+
+            console.warn("AVPlay informou fim do stream.");
+            agendarReconexaoVideo("stream encerrado");
+        },
+
+        oncurrentplaytime: function () {
+            if (sessao !== playerSessionId) {
+                return;
+            }
+
+            if (!playerReproduzindo) {
+                playerReproduzindo = true;
+                tentativasVideo = 0;
+                esconderCarregamento();
+                definirScreensaver(false);
+            }
+        },
+
+        onerror: function (eventType) {
+            if (sessao !== playerSessionId) {
+                return;
+            }
+
+            console.error("Erro AVPlay: " + eventType);
+            agendarReconexaoVideo("erro do player: " + eventType);
+        },
+
+        onevent: function (eventType, eventData) {
+            if (sessao !== playerSessionId) {
+                return;
+            }
+
+            console.log("Evento AVPlay: " + eventType + " / " + eventData);
+        },
+
+        onsubtitlechange: function () {
+            /* Sem legendas neste app. */
+        },
+
+        ondrmevent: function (drmEvent, drmData) {
+            console.log("Evento DRM: " + drmEvent + " / " + drmData);
+        }
+    };
+}
+
+function agendarReconexaoVideo(motivo) {
+    var atraso;
+
+    if (!appVisivel || exitPromptOpen) {
+        return;
+    }
+
+    if (timerVideo !== null) {
+        return;
+    }
+
+    playerPreparando = false;
+    playerReproduzindo = false;
+    tentativasVideo++;
+
+    console.warn("Reconexão solicitada: " + motivo + ". Tentativa " + tentativasVideo + ".");
+
+    fecharPlayer();
+    definirScreensaver(true);
+
+    if (tentativasVideo <= MAX_TENTATIVAS_VIDEO_CURTAS) {
+        atraso = RETRY_CURTO_MS;
+        mostrarMensagem("Reconectando à transmissão...");
+    } else {
+        atraso = RETRY_LONGO_MS;
+        tentativasVideo = 0;
+        mostrarMensagem("A transmissão está indisponível. Tentaremos novamente automaticamente.");
+    }
+
+    timerVideo = setTimeout(function () {
+        timerVideo = null;
+
+        /* Reconsulta a configuracao: a URL pode ter mudado durante a falha. */
+        tentativasConfig = 0;
+        buscarConfiguracao();
+    }, atraso);
+}
+
+function fecharPlayer() {
+    var estado = null;
+
+    playerSessionId++;
+    playerPreparando = false;
+    playerReproduzindo = false;
+
+    if (!webapisDisponivel() || !webapis.avplay) {
+        return;
+    }
+
+    try {
+        estado = webapis.avplay.getState();
+    } catch (stateError) {
+        estado = null;
+    }
+
+    try {
+        if (estado === "PLAYING" || estado === "PAUSED" || estado === "READY") {
+            webapis.avplay.stop();
+        }
+    } catch (stopError) {
+        console.warn("AVPlay.stop ignorado: " + mensagemErro(stopError));
+    }
+
+    try {
+        /* close() remove a instancia e volta ao estado NONE. */
+        webapis.avplay.close();
+    } catch (closeError) {
+        /* Se ja estiver NONE, alguns firmwares lançam InvalidStateError. */
+        console.warn("AVPlay.close ignorado: " + mensagemErro(closeError));
+    }
+}
+
+function pausarVideo() {
+    if (!webapisDisponivel() || !webapis.avplay) {
+        return;
+    }
+
+    try {
+        if (webapis.avplay.getState() === "PLAYING") {
+            webapis.avplay.pause();
+            playerReproduzindo = false;
+            definirScreensaver(true);
+            console.log("Reprodução pausada pelo controle remoto.");
+        }
+    } catch (e) {
+        console.warn("Não foi possível pausar: " + mensagemErro(e));
+    }
+}
+
+function retomarVideo() {
+    if (!webapisDisponivel() || !webapis.avplay) {
+        return;
+    }
+
+    try {
+        if (webapis.avplay.getState() === "PAUSED") {
+            webapis.avplay.play();
+            playerReproduzindo = true;
+            esconderCarregamento();
+            definirScreensaver(false);
+            console.log("Reprodução retomada pelo controle remoto.");
+        }
+    } catch (e) {
+        console.warn("Não foi possível retomar: " + mensagemErro(e));
+    }
+}
+
+function alternarPlayPause() {
+    var estado;
+
+    if (!webapisDisponivel() || !webapis.avplay) {
+        return;
+    }
+
+    try {
+        estado = webapis.avplay.getState();
+
+        if (estado === "PLAYING") {
+            pausarVideo();
+        } else if (estado === "PAUSED") {
+            retomarVideo();
+        }
+    } catch (e) {
+        console.warn("Não foi possível alternar Play/Pause: " + mensagemErro(e));
+    }
+}
+
+/* Rede                                                                */
+
+function configurarMonitoramentoDeRede() {
+    if (!webapisDisponivel() || !webapis.network) {
+        console.warn("Network API indisponível; o app seguirá usando erros das requisições/player.");
+        return;
+    }
+
+    try {
+        networkListenerId = webapis.network.addNetworkStateChangeListener(function (value) {
+            console.log("Network state: " + value);
+
+            if (value === webapis.network.NetworkState.GATEWAY_DISCONNECTED) {
+                redeConectada = false;
+                tratarRedeDesconectada();
+            } else if (value === webapis.network.NetworkState.GATEWAY_CONNECTED) {
+                redeConectada = true;
+                tratarRedeReconectada();
+            }
+        });
+    } catch (e) {
+        console.warn("Monitoramento de rede não configurado: " + mensagemErro(e));
+    }
+}
+
+function verificarRedeAtual() {
+    if (!webapisDisponivel() || !webapis.network) {
+        return redeConectada;
+    }
+
+    try {
+        redeConectada = webapis.network.isConnectedToGateway();
+        return redeConectada;
+    } catch (e) {
+        console.warn("Não foi possível consultar o gateway: " + mensagemErro(e));
+        return redeConectada;
+    }
+}
+
+function tratarRedeDesconectada() {
+    cancelarTimers();
+    abortarRequisicaoConfig();
+    fecharPlayer();
+    definirScreensaver(true);
+    mostrarMensagem("Sem conexão com a internet. Verifique a rede da TV.");
+}
+
+function tratarRedeReconectada() {
+    if (!appVisivel || exitPromptOpen) {
+        return;
+    }
+
+    mostrarMensagem("Conexão restabelecida. Reconectando...");
+    agendarRetomada(1500);
+}
+
+/* Multitarefa                                                         */
+
+function configurarMultitarefa() {
+    document.addEventListener("visibilitychange", function () {
+        if (document.hidden) {
+            console.log("Aplicativo em segundo plano.");
+            appVisivel = false;
+
+            cancelarTimers();
+            abortarRequisicaoConfig();
+            fecharPlayer();
+            definirScreensaver(true);
+        } else {
+            console.log("Aplicativo retornou ao primeiro plano.");
+            appVisivel = true;
+
+            /* A Samsung recomenda verificar a rede antes de retomar streaming. */
+            if (verificarRedeAtual()) {
+                mostrarMensagem("Reconectando à transmissão...");
+                agendarRetomada(1000);
+            } else {
+                mostrarMensagem("Sem conexão com a internet. Verifique a rede da TV.");
+            }
+        }
+    });
+}
+
+function agendarRetomada(atraso) {
+    if (timerRetomar !== null) {
+        clearTimeout(timerRetomar);
+    }
+
+    timerRetomar = setTimeout(function () {
+        timerRetomar = null;
+        iniciarFluxo();
+    }, atraso);
+}
+
+/* Screensaver                                                         */
+
+function definirScreensaver(ligado) {
+    var estado;
+
+    if (!webapisDisponivel() || !webapis.appcommon) {
+        return;
+    }
+
+    try {
+        estado = ligado
+            ? webapis.appcommon.AppCommonScreenSaverState.SCREEN_SAVER_ON
+            : webapis.appcommon.AppCommonScreenSaverState.SCREEN_SAVER_OFF;
+
+        webapis.appcommon.setScreenSaver(
+            estado,
+            function () {},
+            function (error) {
+                console.warn("Erro ao alterar screensaver: " + mensagemErro(error));
+            }
+        );
+    } catch (e) {
+        console.warn("Screensaver não ajustado: " + mensagemErro(e));
+    }
+}
+
+/* Controle remoto                                                     */
+
+function configurarControleRemoto() {
+    registrarTeclasDeMidia();
+
+    document.addEventListener("keydown", function (e) {
+        var keyCode = e.keyCode;
+        var tratado = false;
+
+        if (exitPromptOpen) {
+            tratado = tratarTeclaNoPopup(keyCode);
+        } else {
+            switch (keyCode) {
+                case KEY_BACK:
+                    abrirPopupDeSaida();
+                    tratado = true;
+                    break;
+
+                case KEY_MEDIA_PLAY_PAUSE:
+                    alternarPlayPause();
+                    tratado = true;
+                    break;
+
+                case KEY_MEDIA_PLAY:
+                    retomarVideo();
+                    tratado = true;
+                    break;
+
+                case KEY_MEDIA_PAUSE:
+                    pausarVideo();
+                    tratado = true;
+                    break;
+
+                default:
+                    console.log("Key code: " + keyCode);
+                    break;
+            }
+        }
+
+        if (tratado) {
+            if (e.preventDefault) {
+                e.preventDefault();
+            }
+
+            if (e.stopPropagation) {
+                e.stopPropagation();
+            }
+        }
+    });
+}
+
+function registrarTeclasDeMidia() {
+    var teclas = ["MediaPlayPause", "MediaPlay", "MediaPause"];
+    var i;
+
+    /*
+     * Back, Enter e setas NAO sao registrados: a Samsung os entrega
+     * automaticamente. Registramos somente teclas especiais de midia.
+     */
+    try {
+        if (typeof tizen === "undefined" || !tizen.tvinputdevice) {
+            return;
+        }
+
+        for (i = 0; i < teclas.length; i++) {
+            try {
+                tizen.tvinputdevice.registerKey(teclas[i]);
+                console.log("Tecla registrada: " + teclas[i]);
+            } catch (keyError) {
+                console.warn("Tecla não registrada (" + teclas[i] + "): " + mensagemErro(keyError));
+            }
+        }
+    } catch (e) {
+        console.warn("TVInputDevice indisponível: " + mensagemErro(e));
+    }
+}
+
+function tratarTeclaNoPopup(keyCode) {
+    switch (keyCode) {
+        case KEY_LEFT:
+        case KEY_RIGHT:
+        case KEY_UP:
+        case KEY_DOWN:
+            focoSaida = focoSaida === "sim" ? "nao" : "sim";
+            atualizarFocoSaida();
+            return true;
+
+        case KEY_ENTER:
+            if (focoSaida === "sim") {
+                sairDoAplicativo();
+            } else {
+                fecharPopupDeSaida();
+            }
+            return true;
+
+        case KEY_BACK:
+            fecharPopupDeSaida();
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+function configurarBotoesDoPopup() {
+    var btnSim = document.getElementById("btnSim");
+    var btnNao = document.getElementById("btnNao");
+
+    if (btnSim) {
+        btnSim.onclick = function () {
+            focoSaida = "sim";
+            atualizarFocoSaida();
+            sairDoAplicativo();
+        };
+    }
+
+    if (btnNao) {
+        btnNao.onclick = function () {
+            focoSaida = "nao";
+            atualizarFocoSaida();
+            fecharPopupDeSaida();
+        };
+    }
+}
+
+function abrirPopupDeSaida() {
+    var popup = document.getElementById("exitPrompt");
+
+    if (exitPromptOpen || !popup) {
+        return;
+    }
+
+    exitPromptOpen = true;
+    focoSaida = "sim";
+    atualizarFocoSaida();
+    removerClasse(popup, "hidden");
+}
+
+function fecharPopupDeSaida() {
+    var popup = document.getElementById("exitPrompt");
+
+    if (popup) {
+        adicionarClasse(popup, "hidden");
+    }
+
+    exitPromptOpen = false;
+}
+
+function atualizarFocoSaida() {
+    var btnSim = document.getElementById("btnSim");
+    var btnNao = document.getElementById("btnNao");
+
+    if (!btnSim || !btnNao) {
+        return;
+    }
+
+    btnSim.className = focoSaida === "sim" ? "exitBtn focado" : "exitBtn";
+    btnNao.className = focoSaida === "nao" ? "exitBtn focado" : "exitBtn";
+}
+
+function sairDoAplicativo() {
+    console.log("Saindo do SCTV-HD.");
+
+    cancelarTimers();
+    abortarRequisicaoConfig();
+    fecharPlayer();
+    definirScreensaver(true);
+
+    try {
+        if (typeof tizen !== "undefined" && tizen.application) {
+            tizen.application.getCurrentApplication().exit();
+        }
+    } catch (e) {
+        console.error("Erro ao sair do aplicativo: " + mensagemErro(e));
+        exitPromptOpen = false;
+    }
+}
+
+/* Interface                                                           */
+
+function mostrarMensagem(texto) {
+    var loadingLayer = document.getElementById("loadingLayer");
+    var mensagem = document.getElementById("mensagem");
+
+    if (loadingLayer) {
+        removerClasse(loadingLayer, "hidden");
+    }
+
+    if (mensagem) {
+        mensagem.innerHTML = escaparHtml(texto);
+    }
+}
+
+function esconderCarregamento() {
+    var loadingLayer = document.getElementById("loadingLayer");
+
+    if (loadingLayer) {
+        adicionarClasse(loadingLayer, "hidden");
+    }
+}
+
+/* Utilitarios                                                         */
+
+function webapisDisponivel() {
+    return typeof webapis !== "undefined";
+}
+
+function cancelarTimerConfig() {
+    if (timerConfig !== null) {
+        clearTimeout(timerConfig);
+        timerConfig = null;
+    }
+}
+
+function cancelarTimerVideo() {
+    if (timerVideo !== null) {
+        clearTimeout(timerVideo);
+        timerVideo = null;
+    }
+}
+
+function cancelarTimers() {
+    cancelarTimerConfig();
+    cancelarTimerVideo();
+
+    if (timerRetomar !== null) {
+        clearTimeout(timerRetomar);
+        timerRetomar = null;
+    }
+}
+
+function mensagemErro(error) {
+    if (!error) {
+        return "erro desconhecido";
+    }
+
+    if (error.name || error.message) {
+        return (error.name ? error.name + ": " : "") + (error.message || "");
+    }
+
+    return String(error);
+}
+
+function escaparHtml(texto) {
+    return String(texto)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+function adicionarClasse(elemento, classe) {
+    if (!elemento) {
+        return;
+    }
+
+    if ((" " + elemento.className + " ").indexOf(" " + classe + " ") === -1) {
+        elemento.className = (elemento.className + " " + classe).replace(/^\s+|\s+$/g, "");
+    }
+}
+
+function removerClasse(elemento, classe) {
+    var regex;
+
+    if (!elemento) {
+        return;
+    }
+
+    regex = new RegExp("(^|\\s)" + classe + "(?=\\s|$)", "g");
+    elemento.className = elemento.className.replace(regex, " ").replace(/^\s+|\s+$/g, "");
+}
+
+window.onload = init;

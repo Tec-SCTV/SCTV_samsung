@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets"
+        xmlns:tizen="http://tizen.org/ns/widgets"
+        id="http://yourdomain/SantaCeciliaTV"
+        version="0.6.2"
+        viewmodes="maximized">
+
+    <!--
+        A URL do streaming e obtida dinamicamente. Por isso o pacote precisa
+        permitir acesso a hosts externos que podem mudar sem uma nova versao.
+    -->
+    <access origin="*"/>
+
+    <tizen:application id="SjC34OKxG6.SCTV"
+                       package="SjC34OKxG6"
+                       required_version="6.0"/>
+
+    <content src="index.html"/>
+
+    <feature name="http://tizen.org/feature/screen.size.all"/>
+
+    <icon src="logo_TV_oficial.png"/>
+    <name>SCTV-HD</name>
+
+    <!-- Requisicoes HTTP/HTTPS para configuracao e streaming. -->
+    <tizen:privilege name="http://tizen.org/privilege/internet"/>
+
+    <!-- Necessario para registrar teclas de midia como Play/Pause. -->
+    <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice"/>
+
+    <!-- Necessario para webapis.network. -->
+    <tizen:privilege name="http://developer.samsung.com/privilege/network.public"/>
+
+    <tizen:profile name="tv-samsung"/>
+
+    <tizen:setting screen-orientation="landscape"
+                   context-menu="disable"
+                   background-support="disable"
+                   encryption="disable"
+                   install-location="auto"
+                   hwkey-event="enable"/>
+</widget>

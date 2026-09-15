@@ -1,0 +1,12 @@
+INDEX VERSION 1.3+C:\Users\TECNICA\Documents\MM\SCTV_samsung\version_0.5.9\.metadata\.plugins\org.eclipse.wst.jsdt.core\indexes
+298234410.index
+1848763964.index
+1503822984.index
+2748826811.index
+425414876.index
+1563267173.index
+3837223337.index
+877019361.index
+5183649.index
+378814842.index
+3430558355.index

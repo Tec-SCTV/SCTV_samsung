@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+
+    <title>SCTV-HD</title>
+
+    <link rel="stylesheet" type="text/css" href="css/style.css" />
+
+    <!-- Samsung Product APIs: AVPlay, Network e AppCommon. -->
+    <script type="text/javascript" src="$WEBAPIS/webapis/webapis.js"></script>
+</head>
+<body>
+    <!--
+        O AVPlay usa este objeto como superficie de reproducao.
+        A imagem de carregamento fica em uma camada DOM separada e nunca
+        depende do player conseguir abrir o stream.
+    -->
+    <object id="av-player" type="application/avplayer"></object>
+
+    <div id="loadingLayer">
+        <div id="loadingShade"></div>
+        <div id="mensagem">Conectando à transmissão...</div>
+    </div>
+
+    <div id="exitPrompt" class="hidden">
+        <div id="exitBox">
+            <p id="exitTitulo">Deseja sair do SCTV-HD?</p>
+            <div id="exitBotoes">
+                <div class="exitBtn focado" id="btnSim">Sim</div>
+                <div class="exitBtn" id="btnNao">Não</div>
+            </div>
+        </div>
+    </div>
+
+    <script type="text/javascript" src="js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,142 @@
+* {
+    box-sizing: border-box;
+    font-family: Arial, Helvetica, sans-serif;
+}
+
+html,
+body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: #000000;
+}
+
+/*
+ * Superficie do AVPlay. Nunca usamos z-index negativo.
+ *
+ * IMPORTANTE: este elemento NAO pode ter background. No Tizen TV o video
+ * e desenhado num plano de hardware ABAIXO da camada web, e o <object>
+ * funciona como um recorte transparente por onde a imagem aparece. Pintar
+ * um fundo aqui tapa o recorte: o audio toca e a tela fica preta.
+ */
+#av-player {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+    background: transparent;
+}
+
+/*
+ * A tela de carregamento e independente do player. Assim, mesmo que a URL,
+ * rede ou AVPlay falhem, o usuario nunca recebe apenas uma tela preta muda.
+ */
+#loadingLayer {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 20;
+    background-color: #000000;
+    background-image: url('../TELA-SMART-CARREGAMENTO.jpg');
+    background-repeat: no-repeat;
+    background-position: center center;
+    background-size: cover;
+}
+
+#loadingLayer.hidden {
+    display: none;
+}
+
+#loadingShade {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.18);
+}
+
+#mensagem {
+    position: absolute;
+    left: 50%;
+    bottom: 80px;
+    width: 960px;
+    margin-left: -480px;
+    padding: 18px 28px;
+    color: #ffffff;
+    background: rgba(0, 0, 0, 0.78);
+    border-radius: 12px;
+    font-size: 32px;
+    font-weight: bold;
+    line-height: 1.3;
+    text-align: center;
+}
+
+/* Popup de saida. */
+#exitPrompt {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 100;
+    background: rgba(0, 0, 0, 0.76);
+}
+
+#exitPrompt.hidden {
+    display: none;
+}
+
+#exitBox {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 840px;
+    min-height: 270px;
+    margin-left: -420px;
+    margin-top: -135px;
+    padding: 38px 40px;
+    background: #1c1c1c;
+    border: 2px solid #555555;
+    border-radius: 18px;
+    text-align: center;
+}
+
+#exitTitulo {
+    margin: 0 0 38px 0;
+    color: #ffffff;
+    font-size: 42px;
+    font-weight: bold;
+    line-height: 1.25;
+}
+
+#exitBotoes {
+    text-align: center;
+    white-space: nowrap;
+}
+
+.exitBtn {
+    display: inline-block;
+    width: 250px;
+    margin: 0 22px;
+    padding: 18px 0;
+    color: #ffffff;
+    background: #3a3a3a;
+    border: 4px solid #3a3a3a;
+    border-radius: 10px;
+    font-size: 34px;
+    font-weight: bold;
+    text-align: center;
+}
+
+.exitBtn.focado {
+    color: #000000;
+    background: #ffffff;
+    border-color: #1478ff;
+}
